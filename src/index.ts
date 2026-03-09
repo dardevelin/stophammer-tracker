@@ -13,16 +13,19 @@
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+/** Cloudflare Workers environment bindings. */
 export interface Env {
   NODE_REGISTRY: DurableObjectNamespace;
 }
 
+/** A single node entry stored in Durable Object storage. */
 interface NodeRecord {
   pubkey:    string;
   address:   string;
   last_seen: number; // Unix seconds
 }
 
+/** Request body for POST /nodes/register. */
 interface RegisterBody {
   pubkey:  string;
   address: string;
@@ -53,6 +56,10 @@ function optionsResponse(): Response {
 // ── Worker entry-point ────────────────────────────────────────────────────────
 
 export default {
+  /**
+   * Worker entry-point: routes all requests into the single "global"
+   * NodeRegistry Durable Object instance after handling CORS preflight.
+   */
   async fetch(request: Request, env: Env): Promise<Response> {
     const url    = new URL(request.url);
     const method = request.method.toUpperCase();
@@ -70,6 +77,12 @@ export default {
 
 // ── NodeRegistry Durable Object ───────────────────────────────────────────────
 
+/**
+ * Durable Object that owns the node registry.
+ *
+ * A single instance (keyed "global") holds all node records in its private
+ * storage.  No external KV or D1 is required.
+ */
 export class NodeRegistry {
   private readonly ctx:     DurableObjectState;
 
@@ -77,6 +90,10 @@ export class NodeRegistry {
     this.ctx = ctx;
   }
 
+  /**
+   * Dispatches an inbound request to the appropriate handler.
+   * CORS preflight is handled before any routing logic.
+   */
   async fetch(request: Request): Promise<Response> {
     const url    = new URL(request.url);
     const method = request.method.toUpperCase();
@@ -104,6 +121,13 @@ export class NodeRegistry {
 
   // ── Handlers ───────────────────────────────────────────────────────────────
 
+  /**
+   * Upserts a node record and evicts stale entries.
+   *
+   * Validates that `pubkey` is a non-empty string and `address` is a valid URL,
+   * then writes the record keyed by pubkey.  After writing, nodes not seen in
+   * the last hour are deleted to keep storage bounded.
+   */
   private async handleRegister(request: Request): Promise<Response> {
     let body: RegisterBody;
     try {
@@ -119,6 +143,13 @@ export class NodeRegistry {
       return corsResponse({ error: "address is required" }, 400);
     }
 
+    // Validate that address is a well-formed URL, not arbitrary garbage.
+    try {
+      new URL(body.address.trim());
+    } catch {
+      return corsResponse({ error: "address must be a valid URL" }, 400);
+    }
+
     const record: NodeRecord = {
       pubkey:    body.pubkey.trim(),
       address:   body.address.trim(),
@@ -128,9 +159,29 @@ export class NodeRegistry {
     // Storage key is the pubkey so each node has exactly one record.
     await this.ctx.storage.put<NodeRecord>(`node:${record.pubkey}`, record);
 
+    // Evict nodes not seen in the last hour to keep storage bounded.
+    const evictBefore = nowSecs() - 3600;
+    const all = await this.ctx.storage.list<NodeRecord>({ prefix: "node:" });
+    const staleKeys: string[] = [];
+    for (const [key, r] of all.entries()) {
+      if (r.last_seen < evictBefore) {
+        staleKeys.push(key);
+      }
+    }
+    if (staleKeys.length > 0) {
+      await this.ctx.storage.delete(staleKeys);
+    }
+
     return corsResponse({ ok: true });
   }
 
+  /**
+   * Returns all nodes seen within the last 10 minutes.
+   *
+   * Uses a linear scan over all stored node records.  This is acceptable up to
+   * ~10,000 nodes; beyond that, consider a secondary index or a time-bucketed
+   * storage scheme.
+   */
   private async handleFind(): Promise<Response> {
     const cutoff = nowSecs() - 600; // 10 minutes
 
@@ -150,6 +201,7 @@ export class NodeRegistry {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
+// Pure helper — returns the current wall-clock time as Unix seconds.
 function nowSecs(): number {
   return Math.floor(Date.now() / 1000);
 }
