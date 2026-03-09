@@ -1,0 +1,11 @@
+name            = "stophammer-tracker"
+main            = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[[durable_objects.bindings]]
+name       = "NODE_REGISTRY"
+class_name = "NodeRegistry"
+
+[[migrations]]
+tag                 = "v1"
+new_classes         = ["NodeRegistry"]
